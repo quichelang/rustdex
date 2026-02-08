@@ -1,0 +1,26 @@
+[package]
+name = "rustdex"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "A compact, queryable index of Rust standard library trait implementations"
+readme = "README.md"
+repository = "https://github.com/jagtesh/rustdex"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+rustdoc-types = "0.57"
+serde_json = "1"
+
+[features]
+default = []
+json-export = []        # Enable JSON export in CLI and library
+
+[lib]
+name = "rustdex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustdex"
+path = "src/main.rs"
