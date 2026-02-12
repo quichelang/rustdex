@@ -56,9 +56,11 @@ pub struct StdIndex {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraitImpl {
     /// Full trait path (e.g. "core::iter::traits::collect::FromIterator").
+    /// Empty string for inherent impls (non-trait).
     pub trait_path: String,
 
     /// Short trait name (e.g. "FromIterator").
+    /// Empty string for inherent impls.
     pub trait_name: String,
 
     /// The type that implements the trait (e.g. "HashMap<K, V>").
@@ -74,7 +76,58 @@ pub struct TraitImpl {
     pub associated_types: Vec<(String, String)>,
 
     /// Method signatures provided by this impl.
-    pub methods: Vec<String>,
+    pub methods: Vec<MethodSig>,
+}
+
+/// Receiver mode for a method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReceiverMode {
+    /// No receiver (associated function / static method).
+    None,
+    /// `&self`
+    Ref,
+    /// `&mut self`
+    RefMut,
+    /// `self` (by value / owned)
+    Owned,
+}
+
+/// A parameter in a method signature.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParamSig {
+    /// Parameter name.
+    pub name: String,
+    /// Formatted type string.
+    pub ty: String,
+    /// Whether the param is a reference (`&T` or `&mut T`).
+    pub is_ref: bool,
+    /// Whether the param is a mutable reference (`&mut T`).
+    pub is_mut_ref: bool,
+}
+
+/// A method signature extracted from rustdoc JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MethodSig {
+    /// Method name.
+    pub name: String,
+    /// Receiver mode (`&self`, `&mut self`, `self`, or none).
+    pub receiver: ReceiverMode,
+    /// Parameters (excluding self).
+    pub params: Vec<ParamSig>,
+    /// Formatted return type string ("()" for unit).
+    pub return_type: String,
+}
+
+impl MethodSig {
+    /// Create a minimal `MethodSig` with just a name (defaults to `&self`, no params, `()` return).
+    pub fn simple(name: &str) -> Self {
+        MethodSig {
+            name: name.to_string(),
+            receiver: ReceiverMode::Ref,
+            params: Vec::new(),
+            return_type: "()".to_string(),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -104,6 +157,30 @@ impl StdIndex {
             imp.for_type.contains(type_name)
                 && (imp.trait_name == trait_name || imp.trait_path.contains(trait_name))
         })
+    }
+
+    /// Look up the signature of a method on a type.
+    ///
+    /// Searches all impls (both inherent and trait) for a method with the
+    /// given name on a type whose `for_type` contains `type_name`.
+    /// Returns the first match found.
+    pub fn method_signature(&self, type_name: &str, method_name: &str) -> Option<&MethodSig> {
+        for imp in &self.impls {
+            if !imp.for_type.contains(type_name) {
+                continue;
+            }
+            for method in &imp.methods {
+                if method.name == method_name {
+                    return Some(method);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if a type has a method with the given name (across all impls).
+    pub fn has_method(&self, type_name: &str, method_name: &str) -> bool {
+        self.method_signature(type_name, method_name).is_some()
     }
 
     /// Get summary statistics.
@@ -258,7 +335,7 @@ impl IndexBuilder {
         })
     }
 
-    /// Parse a single rustdoc JSON file and extract trait impls.
+    /// Parse a single rustdoc JSON file and extract impls (both trait and inherent).
     fn build_one(path: &std::path::Path) -> Result<(u32, Vec<TraitImpl>), String> {
         let contents =
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -277,17 +354,19 @@ impl IndexBuilder {
 
         for (_id, item) in &krate.index {
             if let rustdoc_types::ItemEnum::Impl(impl_item) = &item.inner {
-                let trait_ref = match &impl_item.trait_ {
-                    Some(t) => t,
-                    None => continue,
+                // Extract trait info (empty for inherent impls)
+                let (trait_path, trait_name) = match &impl_item.trait_ {
+                    Some(t) => {
+                        let tp = path_lookup
+                            .get(&t.id)
+                            .cloned()
+                            .unwrap_or_else(|| t.path.clone());
+                        let tn = short_path(&t.path);
+                        (tp, tn)
+                    }
+                    None => (String::new(), String::new()),
                 };
 
-                let trait_path = path_lookup
-                    .get(&trait_ref.id)
-                    .cloned()
-                    .unwrap_or_else(|| trait_ref.path.clone());
-
-                let trait_name = short_path(&trait_ref.path);
                 let for_type = format_type(&impl_item.for_, &path_lookup);
 
                 let type_params: Vec<String> = impl_item
@@ -304,17 +383,23 @@ impl IndexBuilder {
                     .map(|wp| format!("{wp:?}"))
                     .collect();
 
-                let methods: Vec<String> = impl_item
+                let methods: Vec<MethodSig> = impl_item
                     .items
                     .iter()
                     .filter_map(|item_id| {
                         let method_item = krate.index.get(item_id)?;
-                        match &method_item.inner {
-                            rustdoc_types::ItemEnum::Function(_) => method_item.name.clone(),
-                            _ => None,
-                        }
+                        let func = match &method_item.inner {
+                            rustdoc_types::ItemEnum::Function(f) => f,
+                            _ => return None,
+                        };
+                        let name = method_item.name.clone()?;
+                        Some(extract_method_sig(&name, func, &path_lookup))
                     })
                     .collect();
+
+                if methods.is_empty() {
+                    continue;
+                }
 
                 impls.push(TraitImpl {
                     trait_path,
@@ -329,6 +414,56 @@ impl IndexBuilder {
         }
 
         Ok((krate.format_version, impls))
+    }
+}
+
+/// Extract a `MethodSig` from a rustdoc `Function` item.
+fn extract_method_sig(
+    name: &str,
+    func: &rustdoc_types::Function,
+    path_lookup: &HashMap<rustdoc_types::Id, String>,
+) -> MethodSig {
+    let mut receiver = ReceiverMode::None;
+    let mut params = Vec::new();
+
+    for (i, (param_name, ty)) in func.sig.inputs.iter().enumerate() {
+        if i == 0 && param_name == "self" {
+            receiver = match ty {
+                rustdoc_types::Type::BorrowedRef { is_mutable, .. } => {
+                    if *is_mutable {
+                        ReceiverMode::RefMut
+                    } else {
+                        ReceiverMode::Ref
+                    }
+                }
+                _ => ReceiverMode::Owned,
+            };
+            continue;
+        }
+
+        let (is_ref, is_mut_ref) = match ty {
+            rustdoc_types::Type::BorrowedRef { is_mutable, .. } => (true, *is_mutable),
+            _ => (false, false),
+        };
+
+        params.push(ParamSig {
+            name: param_name.clone(),
+            ty: format_type(ty, path_lookup),
+            is_ref,
+            is_mut_ref,
+        });
+    }
+
+    let return_type = match &func.sig.output {
+        Some(ty) => format_type(ty, path_lookup),
+        None => "()".to_string(),
+    };
+
+    MethodSig {
+        name: name.to_string(),
+        receiver,
+        params,
+        return_type,
     }
 }
 
@@ -515,7 +650,7 @@ mod tests {
                     type_params: vec![],
                     where_predicates: vec![],
                     associated_types: vec![],
-                    methods: vec!["fmt".to_string()],
+                    methods: vec![MethodSig::simple("fmt")],
                 },
                 TraitImpl {
                     trait_path: "core::iter::traits::collect::FromIterator".to_string(),
@@ -524,7 +659,7 @@ mod tests {
                     type_params: vec!["T".to_string()],
                     where_predicates: vec![],
                     associated_types: vec![],
-                    methods: vec!["from_iter".to_string()],
+                    methods: vec![MethodSig::simple("from_iter")],
                 },
                 TraitImpl {
                     trait_path: "core::iter::traits::collect::FromIterator".to_string(),
@@ -533,7 +668,7 @@ mod tests {
                     type_params: vec!["K: Eq + Hash".to_string(), "V".to_string()],
                     where_predicates: vec![],
                     associated_types: vec![],
-                    methods: vec!["from_iter".to_string()],
+                    methods: vec![MethodSig::simple("from_iter")],
                 },
                 TraitImpl {
                     trait_path: "core::iter::traits::collect::IntoIterator".to_string(),
@@ -542,7 +677,7 @@ mod tests {
                     type_params: vec!["T".to_string()],
                     where_predicates: vec![],
                     associated_types: vec![("Item".to_string(), "T".to_string())],
-                    methods: vec!["into_iter".to_string()],
+                    methods: vec![MethodSig::simple("into_iter")],
                 },
                 TraitImpl {
                     trait_path: "core::iter::traits::collect::IntoIterator".to_string(),
@@ -551,7 +686,7 @@ mod tests {
                     type_params: vec!["'a".to_string(), "T".to_string()],
                     where_predicates: vec![],
                     associated_types: vec![],
-                    methods: vec!["into_iter".to_string()],
+                    methods: vec![MethodSig::simple("into_iter")],
                 },
                 TraitImpl {
                     trait_path: "core::clone::Clone".to_string(),
@@ -560,7 +695,7 @@ mod tests {
                     type_params: vec!["T: Clone".to_string()],
                     where_predicates: vec![],
                     associated_types: vec![],
-                    methods: vec!["clone".to_string()],
+                    methods: vec![MethodSig::simple("clone")],
                 },
                 TraitImpl {
                     trait_path: "core::ops::deref::Deref".to_string(),
@@ -569,7 +704,7 @@ mod tests {
                     type_params: vec!["T".to_string()],
                     where_predicates: vec![],
                     associated_types: vec![("Target".to_string(), "[T]".to_string())],
-                    methods: vec!["deref".to_string()],
+                    methods: vec![MethodSig::simple("deref")],
                 },
                 TraitImpl {
                     trait_path: "core::fmt::Display".to_string(),
@@ -578,7 +713,7 @@ mod tests {
                     type_params: vec![],
                     where_predicates: vec![],
                     associated_types: vec![],
-                    methods: vec!["fmt".to_string()],
+                    methods: vec![MethodSig::simple("fmt")],
                 },
             ],
         }
@@ -871,7 +1006,7 @@ mod tests {
             type_params: vec![],
             where_predicates: vec![],
             associated_types: vec![("Item".to_string(), "u32".to_string())],
-            methods: vec!["next".to_string()],
+            methods: vec![MethodSig::simple("next")],
         });
 
         let dir = std::env::temp_dir().join("rustdex_test_assoc");
@@ -939,7 +1074,7 @@ mod tests {
             type_params: vec!["T: Clone".to_string()],
             where_predicates: vec![],
             associated_types: vec![],
-            methods: vec!["clone".to_string()],
+            methods: vec![MethodSig::simple("clone")],
         });
 
         let results = index.find_impls_for("Vec");

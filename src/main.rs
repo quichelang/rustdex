@@ -150,7 +150,14 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
                 let methods = if imp.methods.is_empty() {
                     String::new()
                 } else {
-                    format!(" [{}]", imp.methods.join(", "))
+                    format!(
+                        " [{}]",
+                        imp.methods
+                            .iter()
+                            .map(|m| m.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
                 };
                 println!("  {}{methods}", imp.trait_name);
             }
@@ -185,7 +192,14 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
                 println!("   where {}", imp.type_params.join(", "));
             }
             if !imp.methods.is_empty() {
-                println!("   methods: {}", imp.methods.join(", "));
+                println!(
+                    "   methods: {}",
+                    imp.methods
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }
     } else {
