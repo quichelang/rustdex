@@ -319,13 +319,35 @@ impl IndexBuilder {
             all_impls.append(&mut impls);
         }
 
-        // Sort and deduplicate: same (trait_name, for_type) can appear across crates
+        // Merge impls with the same (trait_name, for_type) across crates.
+        // Types like `str` and `HashMap` have multiple inherent impl blocks
+        // in rustdoc JSON, each containing different methods. A naive dedup
+        // would drop methods from duplicate entries; instead we merge them.
+        let mut groups: HashMap<(String, String), TraitImpl> = HashMap::new();
+        for imp in all_impls {
+            let key = (imp.trait_name.clone(), imp.for_type.clone());
+            groups
+                .entry(key)
+                .and_modify(|existing| {
+                    for method in &imp.methods {
+                        if !existing.methods.iter().any(|m| m.name == method.name) {
+                            existing.methods.push(method.clone());
+                        }
+                    }
+                    for at in &imp.associated_types {
+                        if !existing.associated_types.iter().any(|(n, _)| n == &at.0) {
+                            existing.associated_types.push(at.clone());
+                        }
+                    }
+                })
+                .or_insert(imp);
+        }
+        let mut all_impls: Vec<TraitImpl> = groups.into_values().collect();
         all_impls.sort_by(|a, b| {
             a.trait_name
                 .cmp(&b.trait_name)
                 .then(a.for_type.cmp(&b.for_type))
         });
-        all_impls.dedup_by(|a, b| a.trait_name == b.trait_name && a.for_type == b.for_type);
 
         Ok(StdIndex {
             rust_version: version,
