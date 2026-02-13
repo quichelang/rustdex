@@ -36,9 +36,9 @@ use std::path::{Path, PathBuf};
 // Index data model
 // ─────────────────────────────────────────────────────────────────────────
 
-/// A compact index of trait implementations from the Rust standard library.
+/// A compact index of trait implementations from a crate (std or otherwise).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StdIndex {
+pub struct CrateIndex {
     /// Rust compiler version this index was generated from (e.g. "1.85.0").
     pub rust_version: String,
 
@@ -48,11 +48,288 @@ pub struct StdIndex {
     /// rustdoc JSON format version used.
     pub format_version: u32,
 
-    /// All trait implementations extracted from std.
+    /// All trait implementations extracted from the crate(s).
     pub impls: Vec<TraitImpl>,
+    #[serde(default)]
+    pub functions: Vec<FunctionRecord>,
 }
 
-/// A single trait implementation record.
+/// Backward compatibility alias.
+pub type StdIndex = CrateIndex;
+
+// ... (existing structures: TraitImpl, ReceiverMode, ParamSig, MethodSig) ...
+
+impl CrateIndex {
+    // ... (existing query methods: find_impls_for, find_implementors, implements, method_signature, has_method, stats) ...
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Persistence
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Save the index as bincode to a file.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let data = bincode::serialize(self).map_err(|e| format!("bincode error: {e}"))?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, &data).map_err(|e| format!("write error: {e}"))?;
+        Ok(())
+    }
+
+    /// Load the index from a bincode file.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let data = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
+        bincode::deserialize(&data).map_err(|e| format!("bincode error: {e}"))
+    }
+
+    /// Save to the default sysroot location.
+    pub fn save_to_sysroot(&self) -> Result<PathBuf, String> {
+        let dir = sysroot_json_dir()?;
+        let path = dir.join(format!("rustdex_{}.bin", self.rust_version));
+        self.save(&path)?;
+        Ok(path)
+    }
+
+    /// Load from the default sysroot location for the current Rust version.
+    pub fn load_from_sysroot() -> Result<Self, String> {
+        let version = rust_version()?;
+        let dir = sysroot_json_dir()?;
+        let path = dir.join(format!("rustdex_{version}.bin"));
+        if path.exists() {
+            Self::load(&path)
+        } else {
+            Err(format!(
+                "No index found at {}. Run `rustdex build` first.",
+                path.display()
+            ))
+        }
+    }
+
+    /// Export as JSON string. Always available since serde_json is a required
+    /// dependency (used for parsing rustdoc input).
+    pub fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self).map_err(|e| format!("json error: {e}"))
+    }
+}
+
+// ... (IndexStats struct) ...
+
+// ─────────────────────────────────────────────────────────────────────────
+// Index builder (parses rustdoc JSON)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Builder that parses rustdoc JSON and produces a `CrateIndex`.
+pub struct IndexBuilder {
+    json_paths: Vec<PathBuf>,
+}
+
+impl IndexBuilder {
+    /// Create a builder from an explicit path to a rustdoc JSON file.
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            json_paths: vec![path.into()],
+        }
+    }
+
+    /// Create a builder from multiple rustdoc JSON files.
+    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
+        Self { json_paths: paths }
+    }
+
+    /// Create a builder that reads `std.json`, `core.json`, and `alloc.json`
+    /// from the current toolchain's sysroot for complete coverage.
+    ///
+    /// Vec, String, Box, etc. have their trait impls in `alloc.json`.
+    /// Primitive types (i32, bool, etc.) have theirs in `core.json`.
+    pub fn from_sysroot() -> Result<Self, String> {
+        ensure_rust_docs_json_installed()?;
+
+        let dir = sysroot_json_dir()?;
+        let mut paths = Vec::new();
+
+        for name in ["std.json", "core.json", "alloc.json"] {
+            let path = dir.join(name);
+            if path.exists() {
+                paths.push(path);
+            }
+        }
+
+        if paths.is_empty() {
+            return Err(format!(
+                "No rustdoc JSON found at {}. Install with: rustup component add rust-docs-json",
+                dir.display()
+            ));
+        }
+
+        Ok(Self { json_paths: paths })
+    }
+
+    /// Parse all rustdoc JSON files and build a merged index.
+    pub fn build(&self) -> Result<CrateIndex, String> {
+        let version = rust_version()?;
+        let now = chrono_lite_now();
+        let mut all_impls = Vec::new();
+        let mut all_functions = Vec::new();
+        let mut format_version = 0u32;
+
+        for path in &self.json_paths {
+            let (fv, mut impls, mut functions) = Self::build_one(path)?;
+            format_version = fv;
+            all_impls.append(&mut impls);
+            all_functions.append(&mut functions);
+        }
+
+        // Merge impls with the same (trait_name, for_type) across crates.
+        let mut groups: HashMap<(String, String), TraitImpl> = HashMap::new();
+        for imp in all_impls {
+            let key = (imp.trait_name.clone(), imp.for_type.clone());
+            groups
+                .entry(key)
+                .and_modify(|existing| {
+                    for method in &imp.methods {
+                        if !existing.methods.iter().any(|m| m.name == method.name) {
+                            existing.methods.push(method.clone());
+                        }
+                    }
+                    for at in &imp.associated_types {
+                        if !existing.associated_types.iter().any(|(n, _)| n == &at.0) {
+                            existing.associated_types.push(at.clone());
+                        }
+                    }
+                })
+                .or_insert(imp);
+        }
+        let mut all_impls: Vec<TraitImpl> = groups.into_values().collect();
+        all_impls.sort_by(|a, b| {
+            a.trait_name
+                .cmp(&b.trait_name)
+                .then(a.for_type.cmp(&b.for_type))
+        });
+
+        // Dedup functions by path
+        let mut func_map: HashMap<String, FunctionRecord> = HashMap::new();
+        for func in all_functions {
+            func_map.entry(func.path.clone()).or_insert(func);
+        }
+        let mut unique_functions: Vec<FunctionRecord> = func_map.into_values().collect();
+        unique_functions.sort_by(|a, b| a.path.cmp(&b.path));
+
+        Ok(CrateIndex {
+            rust_version: version,
+            generated_at: now,
+            format_version,
+            impls: all_impls,
+            functions: unique_functions,
+        })
+    }
+
+    /// Parse a single rustdoc JSON file and extract impls (both trait and inherent) and functions.
+    fn build_one(
+        path: &std::path::Path,
+    ) -> Result<(u32, Vec<TraitImpl>, Vec<FunctionRecord>), String> {
+        let contents =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+
+        let krate: rustdoc_types::Crate = serde_json::from_str(&contents)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+
+        // Build path lookup: id → full path string
+        let path_lookup: HashMap<rustdoc_types::Id, String> = krate
+            .paths
+            .iter()
+            .map(|(id, summary)| (id.clone(), summary.path.join("::")))
+            .collect();
+
+        let mut impls = Vec::new();
+        let mut functions = Vec::new();
+
+        for (_id, item) in &krate.index {
+            match &item.inner {
+                rustdoc_types::ItemEnum::Impl(impl_item) => {
+                    // Extract trait info (empty for inherent impls)
+                    let (trait_path, trait_name) = match &impl_item.trait_ {
+                        Some(t) => {
+                            let tp = path_lookup
+                                .get(&t.id)
+                                .cloned()
+                                .unwrap_or_else(|| t.path.clone());
+                            let tn = short_path(&t.path);
+                            (tp, tn)
+                        }
+                        None => (String::new(), String::new()),
+                    };
+
+                    let for_type = format_type(&impl_item.for_, &path_lookup);
+
+                    let type_params: Vec<String> = impl_item
+                        .generics
+                        .params
+                        .iter()
+                        .map(|p| format_generic_param(p))
+                        .collect();
+
+                    let where_predicates: Vec<String> = impl_item
+                        .generics
+                        .where_predicates
+                        .iter()
+                        .map(|wp| format!("{wp:?}"))
+                        .collect();
+
+                    let methods: Vec<MethodSig> = impl_item
+                        .items
+                        .iter()
+                        .filter_map(|item_id| {
+                            let method_item = krate.index.get(item_id)?;
+                            let func = match &method_item.inner {
+                                rustdoc_types::ItemEnum::Function(f) => f,
+                                _ => return None,
+                            };
+                            let name = method_item.name.clone()?;
+                            Some(extract_method_sig(&name, func, &path_lookup))
+                        })
+                        .collect();
+
+                    if methods.is_empty() {
+                        continue;
+                    }
+
+                    impls.push(TraitImpl {
+                        trait_path,
+                        trait_name,
+                        for_type,
+                        type_params,
+                        where_predicates,
+                        associated_types: vec![],
+                        methods,
+                    });
+                }
+                rustdoc_types::ItemEnum::Function(func) => {
+                    if let Some(name) = &item.name {
+                        // Check visibility - only index public functions
+                        if item.visibility == rustdoc_types::Visibility::Public {
+                            let path = path_lookup
+                                .get(&item.id)
+                                .cloned()
+                                .unwrap_or_else(|| name.clone());
+
+                            let sig = extract_method_sig(name, func, &path_lookup);
+                            functions.push(FunctionRecord {
+                                path,
+                                name: name.clone(),
+                                sig,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok((krate.format_version, impls, functions))
+    }
+}
+
+/// A trait implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraitImpl {
     /// Full trait path (e.g. "core::iter::traits::collect::FromIterator").
@@ -77,6 +354,14 @@ pub struct TraitImpl {
 
     /// Method signatures provided by this impl.
     pub methods: Vec<MethodSig>,
+}
+
+/// A top-level function record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionRecord {
+    pub path: String, // e.g. "host::scan_dir"
+    pub name: String, // "scan_dir"
+    pub sig: MethodSig,
 }
 
 /// Receiver mode for a method.
@@ -134,13 +419,23 @@ impl MethodSig {
 // Index querying
 // ─────────────────────────────────────────────────────────────────────────
 
-impl StdIndex {
+impl CrateIndex {
     /// Find all trait impls for a given type name (substring match on `for_type`).
     pub fn find_impls_for(&self, type_name: &str) -> Vec<&TraitImpl> {
         self.impls
             .iter()
             .filter(|imp| imp.for_type.contains(type_name))
             .collect()
+    }
+
+    /// Look up a top-level function signature by path.
+    ///
+    /// e.g. `lookup_function("host::scan_dir")`
+    pub fn lookup_function(&self, path: &str) -> Option<&MethodSig> {
+        self.functions
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| &f.sig)
     }
 
     /// Find all types implementing a given trait (substring match on `trait_name`).
@@ -203,50 +498,6 @@ impl StdIndex {
             },
         }
     }
-
-    // ─── Persistence ─────────────────────────────────────────────────
-
-    /// Save the index as bincode to a file.
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        let data = bincode::serialize(self).map_err(|e| format!("bincode error: {e}"))?;
-        std::fs::write(path, &data).map_err(|e| format!("write error: {e}"))?;
-        Ok(())
-    }
-
-    /// Load the index from a bincode file.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
-        bincode::deserialize(&data).map_err(|e| format!("bincode error: {e}"))
-    }
-
-    /// Save to the default sysroot location.
-    pub fn save_to_sysroot(&self) -> Result<PathBuf, String> {
-        let dir = sysroot_json_dir()?;
-        let path = dir.join(format!("rustdex_{}.bin", self.rust_version));
-        self.save(&path)?;
-        Ok(path)
-    }
-
-    /// Load from the default sysroot location for the current Rust version.
-    pub fn load_from_sysroot() -> Result<Self, String> {
-        let version = rust_version()?;
-        let dir = sysroot_json_dir()?;
-        let path = dir.join(format!("rustdex_{version}.bin"));
-        if path.exists() {
-            Self::load(&path)
-        } else {
-            Err(format!(
-                "No index found at {}. Run `rustdex build` first.",
-                path.display()
-            ))
-        }
-    }
-
-    /// Export as JSON string. Always available since serde_json is a required
-    /// dependency (used for parsing rustdoc input).
-    pub fn to_json(&self) -> Result<String, String> {
-        serde_json::to_string_pretty(self).map_err(|e| format!("json error: {e}"))
-    }
 }
 
 /// Summary statistics for an index.
@@ -261,183 +512,6 @@ pub struct IndexStats {
 // ─────────────────────────────────────────────────────────────────────────
 // Index builder (parses rustdoc JSON)
 // ─────────────────────────────────────────────────────────────────────────
-
-/// Builder that parses rustdoc JSON and produces a `StdIndex`.
-pub struct IndexBuilder {
-    json_paths: Vec<PathBuf>,
-}
-
-impl IndexBuilder {
-    /// Create a builder from an explicit path to a rustdoc JSON file.
-    pub fn from_path(path: impl Into<PathBuf>) -> Self {
-        Self {
-            json_paths: vec![path.into()],
-        }
-    }
-
-    /// Create a builder from multiple rustdoc JSON files.
-    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
-        Self { json_paths: paths }
-    }
-
-    /// Create a builder that reads `std.json`, `core.json`, and `alloc.json`
-    /// from the current toolchain's sysroot for complete coverage.
-    ///
-    /// Vec, String, Box, etc. have their trait impls in `alloc.json`.
-    /// Primitive types (i32, bool, etc.) have theirs in `core.json`.
-    pub fn from_sysroot() -> Result<Self, String> {
-        let dir = sysroot_json_dir()?;
-        let mut paths = Vec::new();
-
-        for name in ["std.json", "core.json", "alloc.json"] {
-            let path = dir.join(name);
-            if path.exists() {
-                paths.push(path);
-            }
-        }
-
-        if paths.is_empty() {
-            return Err(format!(
-                "No rustdoc JSON found at {}. Install with: rustup component add rust-docs-json",
-                dir.display()
-            ));
-        }
-
-        Ok(Self { json_paths: paths })
-    }
-
-    /// Parse all rustdoc JSON files and build a merged index.
-    pub fn build(&self) -> Result<StdIndex, String> {
-        let version = rust_version()?;
-        let now = chrono_lite_now();
-        let mut all_impls = Vec::new();
-        let mut format_version = 0u32;
-
-        for path in &self.json_paths {
-            let (fv, mut impls) = Self::build_one(path)?;
-            format_version = fv;
-            all_impls.append(&mut impls);
-        }
-
-        // Merge impls with the same (trait_name, for_type) across crates.
-        // Types like `str` and `HashMap` have multiple inherent impl blocks
-        // in rustdoc JSON, each containing different methods. A naive dedup
-        // would drop methods from duplicate entries; instead we merge them.
-        let mut groups: HashMap<(String, String), TraitImpl> = HashMap::new();
-        for imp in all_impls {
-            let key = (imp.trait_name.clone(), imp.for_type.clone());
-            groups
-                .entry(key)
-                .and_modify(|existing| {
-                    for method in &imp.methods {
-                        if !existing.methods.iter().any(|m| m.name == method.name) {
-                            existing.methods.push(method.clone());
-                        }
-                    }
-                    for at in &imp.associated_types {
-                        if !existing.associated_types.iter().any(|(n, _)| n == &at.0) {
-                            existing.associated_types.push(at.clone());
-                        }
-                    }
-                })
-                .or_insert(imp);
-        }
-        let mut all_impls: Vec<TraitImpl> = groups.into_values().collect();
-        all_impls.sort_by(|a, b| {
-            a.trait_name
-                .cmp(&b.trait_name)
-                .then(a.for_type.cmp(&b.for_type))
-        });
-
-        Ok(StdIndex {
-            rust_version: version,
-            generated_at: now,
-            format_version,
-            impls: all_impls,
-        })
-    }
-
-    /// Parse a single rustdoc JSON file and extract impls (both trait and inherent).
-    fn build_one(path: &std::path::Path) -> Result<(u32, Vec<TraitImpl>), String> {
-        let contents =
-            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-
-        let krate: rustdoc_types::Crate = serde_json::from_str(&contents)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
-
-        // Build path lookup: id → full path string
-        let path_lookup: HashMap<rustdoc_types::Id, String> = krate
-            .paths
-            .iter()
-            .map(|(id, summary)| (id.clone(), summary.path.join("::")))
-            .collect();
-
-        let mut impls = Vec::new();
-
-        for (_id, item) in &krate.index {
-            if let rustdoc_types::ItemEnum::Impl(impl_item) = &item.inner {
-                // Extract trait info (empty for inherent impls)
-                let (trait_path, trait_name) = match &impl_item.trait_ {
-                    Some(t) => {
-                        let tp = path_lookup
-                            .get(&t.id)
-                            .cloned()
-                            .unwrap_or_else(|| t.path.clone());
-                        let tn = short_path(&t.path);
-                        (tp, tn)
-                    }
-                    None => (String::new(), String::new()),
-                };
-
-                let for_type = format_type(&impl_item.for_, &path_lookup);
-
-                let type_params: Vec<String> = impl_item
-                    .generics
-                    .params
-                    .iter()
-                    .map(|p| format_generic_param(p))
-                    .collect();
-
-                let where_predicates: Vec<String> = impl_item
-                    .generics
-                    .where_predicates
-                    .iter()
-                    .map(|wp| format!("{wp:?}"))
-                    .collect();
-
-                let methods: Vec<MethodSig> = impl_item
-                    .items
-                    .iter()
-                    .filter_map(|item_id| {
-                        let method_item = krate.index.get(item_id)?;
-                        let func = match &method_item.inner {
-                            rustdoc_types::ItemEnum::Function(f) => f,
-                            _ => return None,
-                        };
-                        let name = method_item.name.clone()?;
-                        Some(extract_method_sig(&name, func, &path_lookup))
-                    })
-                    .collect();
-
-                if methods.is_empty() {
-                    continue;
-                }
-
-                impls.push(TraitImpl {
-                    trait_path,
-                    trait_name,
-                    for_type,
-                    type_params,
-                    where_predicates,
-                    associated_types: vec![],
-                    methods,
-                });
-            }
-        }
-
-        Ok((krate.format_version, impls))
-    }
-}
 
 /// Extract a `MethodSig` from a rustdoc `Function` item.
 fn extract_method_sig(
@@ -652,6 +726,54 @@ fn chrono_lite_now() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Ensure the `rust-docs-json` component is installed for the current toolchain.
+///
+/// This runs `rustup component add rust-docs-json` if the component is missing.
+/// It detects the active toolchain via `rustup show`.
+pub fn ensure_rust_docs_json_installed() -> Result<(), String> {
+    // Check if we even have rustup
+    if std::process::Command::new("rustup")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        // No rustup, assume user knows what they're doing or we can't help
+        return Ok(());
+    }
+
+    // Check if component is listed in `rustup component list --installed`
+    let output = std::process::Command::new("rustup")
+        .arg("component")
+        .arg("list")
+        .arg("--installed")
+        .output()
+        .map_err(|e| format!("Failed to run rustup component list: {e}"))?;
+
+    let installed = String::from_utf8_lossy(&output.stdout);
+    if installed.contains("rust-docs-json") {
+        return Ok(());
+    }
+
+    // Attempt to install
+    let install_output = std::process::Command::new("rustup")
+        .arg("component")
+        .arg("add")
+        .arg("rust-docs-json")
+        .output()
+        .map_err(|e| format!("Failed to run rustup component add: {e}"))?;
+
+    if !install_output.status.success() {
+        return Err(format!(
+            "Failed to install rust-docs-json component:\n{}",
+            String::from_utf8_lossy(&install_output.stderr)
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +786,7 @@ mod tests {
             rust_version: "1.85.0-test".to_string(),
             generated_at: "2026-01-01T00:00:00Z".to_string(),
             format_version: 42,
+            functions: vec![],
             impls: vec![
                 TraitImpl {
                     trait_path: "core::fmt::Display".to_string(),
@@ -926,6 +1049,7 @@ mod tests {
             rust_version: "test".to_string(),
             generated_at: "now".to_string(),
             format_version: 1,
+            functions: vec![],
             impls: vec![],
         };
         let stats = index.stats();
