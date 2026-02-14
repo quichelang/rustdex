@@ -206,6 +206,12 @@ impl IndexBuilder {
                 .then(a.for_type.cmp(&b.for_type))
         });
 
+        // ── Synthetic [T] inherent methods ───────────────────────────────
+        // rustdoc JSON doesn't include item definitions for primitive slice
+        // inherent impls (IDs exist but point to missing entries). Inject a
+        // hardcoded table until rustdoc fixes this upstream.
+        all_impls.push(synthetic_slice_impl());
+
         // Dedup functions by path
         let mut func_map: HashMap<String, FunctionRecord> = HashMap::new();
         for func in all_functions {
@@ -680,6 +686,182 @@ fn format_generic_param(param: &rustdoc_types::GenericParamDef) -> String {
         rustdoc_types::GenericParamDefKind::Const { type_, .. } => {
             format!("const {}: {:?}", param.name, type_)
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Synthetic primitive slice methods
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Generate a synthetic inherent impl for `[T]` containing common slice
+/// methods. rustdoc JSON doesn't include definitions for primitive slice
+/// inherent impls (the item IDs exist but point to missing entries).
+fn synthetic_slice_impl() -> TraitImpl {
+    let mut methods = Vec::new();
+
+    // Helper to build a simple MethodSig
+    let method = |name: &str, recv: ReceiverMode, params: Vec<ParamSig>, ret: &str| -> MethodSig {
+        MethodSig {
+            name: name.to_string(),
+            receiver: recv,
+            params,
+            return_type: ret.to_string(),
+        }
+    };
+
+    let param = |name: &str, ty: &str, is_ref: bool, is_mut_ref: bool| -> ParamSig {
+        ParamSig {
+            name: name.to_string(),
+            ty: ty.to_string(),
+            is_ref,
+            is_mut_ref,
+        }
+    };
+
+    // ── &self methods (read-only) ─────────────────────────────────────
+    methods.push(method("len", ReceiverMode::Ref, vec![], "usize"));
+    methods.push(method("is_empty", ReceiverMode::Ref, vec![], "bool"));
+    methods.push(method("first", ReceiverMode::Ref, vec![], "Option<&T>"));
+    methods.push(method("last", ReceiverMode::Ref, vec![], "Option<&T>"));
+    methods.push(method(
+        "get",
+        ReceiverMode::Ref,
+        vec![param("index", "usize", false, false)],
+        "Option<&T>",
+    ));
+    methods.push(method(
+        "contains",
+        ReceiverMode::Ref,
+        vec![param("x", "&T", true, false)],
+        "bool",
+    ));
+    methods.push(method("iter", ReceiverMode::Ref, vec![], "Iter<T>"));
+    methods.push(method(
+        "windows",
+        ReceiverMode::Ref,
+        vec![param("size", "usize", false, false)],
+        "Windows<T>",
+    ));
+    methods.push(method(
+        "chunks",
+        ReceiverMode::Ref,
+        vec![param("chunk_size", "usize", false, false)],
+        "Chunks<T>",
+    ));
+    methods.push(method(
+        "split_at",
+        ReceiverMode::Ref,
+        vec![param("mid", "usize", false, false)],
+        "(&[T], &[T])",
+    ));
+    methods.push(method(
+        "binary_search",
+        ReceiverMode::Ref,
+        vec![param("x", "&T", true, false)],
+        "Result<usize, usize>",
+    ));
+    methods.push(method(
+        "starts_with",
+        ReceiverMode::Ref,
+        vec![param("needle", "&[T]", true, false)],
+        "bool",
+    ));
+    methods.push(method(
+        "ends_with",
+        ReceiverMode::Ref,
+        vec![param("needle", "&[T]", true, false)],
+        "bool",
+    ));
+    methods.push(method("to_vec", ReceiverMode::Ref, vec![], "Vec<T>"));
+    methods.push(method(
+        "repeat",
+        ReceiverMode::Ref,
+        vec![param("n", "usize", false, false)],
+        "Vec<T>",
+    ));
+    methods.push(method(
+        "join",
+        ReceiverMode::Ref,
+        vec![param("sep", "&T", true, false)],
+        "Vec<T>",
+    ));
+
+    // ── &mut self methods (mutating) ──────────────────────────────────
+    methods.push(method("sort", ReceiverMode::RefMut, vec![], "()"));
+    methods.push(method("sort_unstable", ReceiverMode::RefMut, vec![], "()"));
+    methods.push(method(
+        "sort_by",
+        ReceiverMode::RefMut,
+        vec![param("compare", "F", false, false)],
+        "()",
+    ));
+    methods.push(method(
+        "sort_unstable_by",
+        ReceiverMode::RefMut,
+        vec![param("compare", "F", false, false)],
+        "()",
+    ));
+    methods.push(method(
+        "sort_by_key",
+        ReceiverMode::RefMut,
+        vec![param("f", "F", false, false)],
+        "()",
+    ));
+    methods.push(method("reverse", ReceiverMode::RefMut, vec![], "()"));
+    methods.push(method(
+        "swap",
+        ReceiverMode::RefMut,
+        vec![
+            param("a", "usize", false, false),
+            param("b", "usize", false, false),
+        ],
+        "()",
+    ));
+    methods.push(method(
+        "rotate_left",
+        ReceiverMode::RefMut,
+        vec![param("mid", "usize", false, false)],
+        "()",
+    ));
+    methods.push(method(
+        "rotate_right",
+        ReceiverMode::RefMut,
+        vec![param("k", "usize", false, false)],
+        "()",
+    ));
+    methods.push(method(
+        "fill",
+        ReceiverMode::RefMut,
+        vec![param("value", "T", false, false)],
+        "()",
+    ));
+    methods.push(method(
+        "iter_mut",
+        ReceiverMode::RefMut,
+        vec![],
+        "IterMut<T>",
+    ));
+    methods.push(method(
+        "copy_from_slice",
+        ReceiverMode::RefMut,
+        vec![param("src", "&[T]", true, false)],
+        "()",
+    ));
+    methods.push(method(
+        "retain",
+        ReceiverMode::RefMut,
+        vec![param("f", "F", false, false)],
+        "()",
+    ));
+
+    TraitImpl {
+        trait_path: String::new(), // inherent impl
+        trait_name: String::new(),
+        for_type: "[T]".to_string(),
+        type_params: vec!["T".to_string()],
+        where_predicates: vec![],
+        associated_types: vec![],
+        methods,
     }
 }
 
