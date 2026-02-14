@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elevate-types"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -46,6 +55,7 @@ name = "rustdex"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "elevate-types",
  "rustdoc-types",
  "serde",
  "serde_json",

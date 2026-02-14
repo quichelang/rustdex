@@ -28,91 +28,12 @@
 //! }
 //! ```
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-// ─────────────────────────────────────────────────────────────────────────
-// Index data model
-// ─────────────────────────────────────────────────────────────────────────
-
-/// A compact index of trait implementations from a crate (std or otherwise).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CrateIndex {
-    /// Rust compiler version this index was generated from (e.g. "1.85.0").
-    pub rust_version: String,
-
-    /// Timestamp when the index was generated.
-    pub generated_at: String,
-
-    /// rustdoc JSON format version used.
-    pub format_version: u32,
-
-    /// All trait implementations extracted from the crate(s).
-    pub impls: Vec<TraitImpl>,
-    #[serde(default)]
-    pub functions: Vec<FunctionRecord>,
-}
-
-/// Backward compatibility alias.
-pub type StdIndex = CrateIndex;
-
-// ... (existing structures: TraitImpl, ReceiverMode, ParamSig, MethodSig) ...
-
-impl CrateIndex {
-    // ... (existing query methods: find_impls_for, find_implementors, implements, method_signature, has_method, stats) ...
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Persistence
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Save the index as bincode to a file.
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        let data = bincode::serialize(self).map_err(|e| format!("bincode error: {e}"))?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(path, &data).map_err(|e| format!("write error: {e}"))?;
-        Ok(())
-    }
-
-    /// Load the index from a bincode file.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
-        bincode::deserialize(&data).map_err(|e| format!("bincode error: {e}"))
-    }
-
-    /// Save to the default sysroot location.
-    pub fn save_to_sysroot(&self) -> Result<PathBuf, String> {
-        let dir = sysroot_json_dir()?;
-        let path = dir.join(format!("rustdex_{}.bin", self.rust_version));
-        self.save(&path)?;
-        Ok(path)
-    }
-
-    /// Load from the default sysroot location for the current Rust version.
-    pub fn load_from_sysroot() -> Result<Self, String> {
-        let version = rust_version()?;
-        let dir = sysroot_json_dir()?;
-        let path = dir.join(format!("rustdex_{version}.bin"));
-        if path.exists() {
-            Self::load(&path)
-        } else {
-            Err(format!(
-                "No index found at {}. Run `rustdex build` first.",
-                path.display()
-            ))
-        }
-    }
-
-    /// Export as JSON string. Always available since serde_json is a required
-    /// dependency (used for parsing rustdoc input).
-    pub fn to_json(&self) -> Result<String, String> {
-        serde_json::to_string_pretty(self).map_err(|e| format!("json error: {e}"))
-    }
-}
-
-// ... (IndexStats struct) ...
+// Re-export all data types, queries, persistence, and sysroot helpers
+// from the lightweight `elevate-types` crate.
+pub use elevate_types::*;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Index builder (parses rustdoc JSON)
@@ -333,186 +254,6 @@ impl IndexBuilder {
 
         Ok((krate.format_version, impls, functions))
     }
-}
-
-/// A trait implementation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TraitImpl {
-    /// Full trait path (e.g. "core::iter::traits::collect::FromIterator").
-    /// Empty string for inherent impls (non-trait).
-    pub trait_path: String,
-
-    /// Short trait name (e.g. "FromIterator").
-    /// Empty string for inherent impls.
-    pub trait_name: String,
-
-    /// The type that implements the trait (e.g. "HashMap<K, V>").
-    pub for_type: String,
-
-    /// Generic type parameters with bounds (e.g. ["K: Eq + Hash", "V"]).
-    pub type_params: Vec<String>,
-
-    /// Where clause predicates.
-    pub where_predicates: Vec<String>,
-
-    /// Associated types (name → type string).
-    pub associated_types: Vec<(String, String)>,
-
-    /// Method signatures provided by this impl.
-    pub methods: Vec<MethodSig>,
-}
-
-/// A top-level function record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionRecord {
-    pub path: String, // e.g. "host::scan_dir"
-    pub name: String, // "scan_dir"
-    pub sig: MethodSig,
-}
-
-/// Receiver mode for a method.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReceiverMode {
-    /// No receiver (associated function / static method).
-    None,
-    /// `&self`
-    Ref,
-    /// `&mut self`
-    RefMut,
-    /// `self` (by value / owned)
-    Owned,
-}
-
-/// A parameter in a method signature.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ParamSig {
-    /// Parameter name.
-    pub name: String,
-    /// Formatted type string.
-    pub ty: String,
-    /// Whether the param is a reference (`&T` or `&mut T`).
-    pub is_ref: bool,
-    /// Whether the param is a mutable reference (`&mut T`).
-    pub is_mut_ref: bool,
-}
-
-/// A method signature extracted from rustdoc JSON.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MethodSig {
-    /// Method name.
-    pub name: String,
-    /// Receiver mode (`&self`, `&mut self`, `self`, or none).
-    pub receiver: ReceiverMode,
-    /// Parameters (excluding self).
-    pub params: Vec<ParamSig>,
-    /// Formatted return type string ("()" for unit).
-    pub return_type: String,
-}
-
-impl MethodSig {
-    /// Create a minimal `MethodSig` with just a name (defaults to `&self`, no params, `()` return).
-    pub fn simple(name: &str) -> Self {
-        MethodSig {
-            name: name.to_string(),
-            receiver: ReceiverMode::Ref,
-            params: Vec::new(),
-            return_type: "()".to_string(),
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Index querying
-// ─────────────────────────────────────────────────────────────────────────
-
-impl CrateIndex {
-    /// Find all trait impls for a given type name (substring match on `for_type`).
-    pub fn find_impls_for(&self, type_name: &str) -> Vec<&TraitImpl> {
-        self.impls
-            .iter()
-            .filter(|imp| imp.for_type.contains(type_name))
-            .collect()
-    }
-
-    /// Look up a top-level function signature by path.
-    ///
-    /// e.g. `lookup_function("host::scan_dir")`
-    pub fn lookup_function(&self, path: &str) -> Option<&MethodSig> {
-        self.functions
-            .iter()
-            .find(|f| f.path == path)
-            .map(|f| &f.sig)
-    }
-
-    /// Find all types implementing a given trait (substring match on `trait_name`).
-    pub fn find_implementors(&self, trait_name: &str) -> Vec<&TraitImpl> {
-        self.impls
-            .iter()
-            .filter(|imp| imp.trait_name == trait_name || imp.trait_path.contains(trait_name))
-            .collect()
-    }
-
-    /// Check if a specific type implements a specific trait.
-    pub fn implements(&self, type_name: &str, trait_name: &str) -> bool {
-        self.impls.iter().any(|imp| {
-            imp.for_type.contains(type_name)
-                && (imp.trait_name == trait_name || imp.trait_path.contains(trait_name))
-        })
-    }
-
-    /// Look up the signature of a method on a type.
-    ///
-    /// Searches all impls (both inherent and trait) for a method with the
-    /// given name on a type whose `for_type` contains `type_name`.
-    /// Returns the first match found.
-    pub fn method_signature(&self, type_name: &str, method_name: &str) -> Option<&MethodSig> {
-        for imp in &self.impls {
-            if !imp.for_type.contains(type_name) {
-                continue;
-            }
-            for method in &imp.methods {
-                if method.name == method_name {
-                    return Some(method);
-                }
-            }
-        }
-        None
-    }
-
-    /// Check if a type has a method with the given name (across all impls).
-    pub fn has_method(&self, type_name: &str, method_name: &str) -> bool {
-        self.method_signature(type_name, method_name).is_some()
-    }
-
-    /// Get summary statistics.
-    pub fn stats(&self) -> IndexStats {
-        let mut traits: HashMap<String, usize> = HashMap::new();
-        let mut types: HashMap<String, usize> = HashMap::new();
-        for imp in &self.impls {
-            *traits.entry(imp.trait_name.clone()).or_default() += 1;
-            *types.entry(imp.for_type.clone()).or_default() += 1;
-        }
-        IndexStats {
-            total_impls: self.impls.len(),
-            unique_traits: traits.len(),
-            unique_types: types.len(),
-            top_traits: {
-                let mut v: Vec<_> = traits.into_iter().collect();
-                v.sort_by(|a, b| b.1.cmp(&a.1));
-                v.truncate(20);
-                v
-            },
-        }
-    }
-}
-
-/// Summary statistics for an index.
-#[derive(Debug)]
-pub struct IndexStats {
-    pub total_impls: usize,
-    pub unique_traits: usize,
-    pub unique_types: usize,
-    pub top_traits: Vec<(String, usize)>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -865,37 +606,6 @@ fn synthetic_slice_impl() -> TraitImpl {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Utility functions
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Get the active Rust compiler version string.
-pub fn rust_version() -> Result<String, String> {
-    let output = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("Failed to run rustc: {e}"))?;
-    let version_str = String::from_utf8_lossy(&output.stdout);
-    // Parse "rustc 1.85.0-nightly (abc123 2024-12-01)" → "1.85.0-nightly"
-    let version = version_str
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("unknown")
-        .to_string();
-    Ok(version)
-}
-
-/// Get the rustdoc JSON directory in the current sysroot.
-pub fn sysroot_json_dir() -> Result<PathBuf, String> {
-    let output = std::process::Command::new("rustc")
-        .arg("--print")
-        .arg("sysroot")
-        .output()
-        .map_err(|e| format!("Failed to run rustc: {e}"))?;
-    let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(PathBuf::from(sysroot).join("share/doc/rust/json"))
-}
-
 /// Simple ISO 8601 timestamp without chrono dependency.
 fn chrono_lite_now() -> String {
     let output = std::process::Command::new("date")
@@ -959,6 +669,7 @@ pub fn ensure_rust_docs_json_installed() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     // ─── Helpers ─────────────────────────────────────────────────────
 
