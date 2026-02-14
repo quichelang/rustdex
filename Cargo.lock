@@ -14,6 +14,7 @@ dependencies = [
 [[package]]
 name = "elevate-types"
 version = "0.1.0"
+source = "git+https://github.com/quichelang/elevate-types.git?rev=f54ad3e#f54ad3ed734fbe50a9998513d716f8310b7c00bd"
 dependencies = [
  "bincode",
  "serde",
