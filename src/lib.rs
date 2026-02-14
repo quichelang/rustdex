@@ -141,13 +141,13 @@ impl IndexBuilder {
         let mut unique_functions: Vec<FunctionRecord> = func_map.into_values().collect();
         unique_functions.sort_by(|a, b| a.path.cmp(&b.path));
 
-        Ok(CrateIndex {
-            rust_version: version,
-            generated_at: now,
+        Ok(CrateIndex::new(
+            version,
+            now,
             format_version,
-            impls: all_impls,
-            functions: unique_functions,
-        })
+            all_impls,
+            unique_functions,
+        ))
     }
 
     /// Parse a single rustdoc JSON file and extract impls (both trait and inherent) and functions.
@@ -675,12 +675,11 @@ mod tests {
 
     /// Build a minimal StdIndex for unit testing without parsing real JSON.
     fn sample_index() -> StdIndex {
-        StdIndex {
-            rust_version: "1.85.0-test".to_string(),
-            generated_at: "2026-01-01T00:00:00Z".to_string(),
-            format_version: 42,
-            functions: vec![],
-            impls: vec![
+        CrateIndex::new(
+            "1.85.0-test".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+            42,
+            vec![
                 TraitImpl {
                     trait_path: "core::fmt::Display".to_string(),
                     trait_name: "Display".to_string(),
@@ -754,7 +753,8 @@ mod tests {
                     methods: vec![MethodSig::simple("fmt")],
                 },
             ],
-        }
+            vec![],
+        )
     }
 
     // ─── short_path ──────────────────────────────────────────────────
@@ -813,10 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn test_find_impls_for_substring_match() {
+    fn test_find_impls_for_by_basename() {
         let index = sample_index();
-        // "ec" matches both "Vec<T>" and "&Vec<T>"
-        let results = index.find_impls_for("ec");
+        // Basename lookup: "Vec" matches Vec<T> and &Vec<T>
+        let results = index.find_impls_for("Vec");
         assert!(results.len() >= 4);
     }
 
@@ -830,9 +830,9 @@ mod tests {
     #[test]
     fn test_find_impls_for_empty_query() {
         let index = sample_index();
-        // Empty string matches everything
+        // Empty string returns nothing with basename lookup
         let results = index.find_impls_for("");
-        assert_eq!(results.len(), index.impls.len());
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -851,14 +851,8 @@ mod tests {
     #[test]
     fn test_find_implementors_by_name() {
         let index = sample_index();
+        // Short name lookup finds Display impls
         let results = index.find_implementors("Display");
-        assert_eq!(results.len(), 2); // String, i32
-    }
-
-    #[test]
-    fn test_find_implementors_by_path_substring() {
-        let index = sample_index();
-        let results = index.find_implementors("core::fmt");
         assert_eq!(results.len(), 2); // Display for String, Display for i32
     }
 
@@ -898,10 +892,11 @@ mod tests {
     }
 
     #[test]
-    fn test_implements_partial_type_match() {
+    fn test_implements_exact_type_match() {
         let index = sample_index();
-        // "ap" matches "HashMap<K, V>" since contains() is used
-        assert!(index.implements("ap", "FromIterator"));
+        // Exact basename match required
+        assert!(index.implements("HashMap", "FromIterator"));
+        assert!(!index.implements("ap", "FromIterator")); // Partial match no longer works
     }
 
     #[test]
@@ -938,13 +933,7 @@ mod tests {
 
     #[test]
     fn test_stats_empty_index() {
-        let index = StdIndex {
-            rust_version: "test".to_string(),
-            generated_at: "now".to_string(),
-            format_version: 1,
-            functions: vec![],
-            impls: vec![],
-        };
+        let index = CrateIndex::new("test".to_string(), "now".to_string(), 1, vec![], vec![]);
         let stats = index.stats();
         assert_eq!(stats.total_impls, 0);
         assert_eq!(stats.unique_traits, 0);
@@ -1079,16 +1068,14 @@ mod tests {
     #[test]
     fn test_query_with_reference_type() {
         let index = sample_index();
+        // Querying "&Vec" strips the & and matches by basename "Vec"
         let results = index.find_impls_for("&Vec");
-        assert!(!results.is_empty(), "Should find impls for '&Vec'");
-        // Should only match &Vec<T>, not Vec<T>
-        for r in &results {
-            assert!(
-                r.for_type.starts_with('&'),
-                "Expected reference type, got: {}",
-                r.for_type
-            );
-        }
+        assert!(
+            !results.is_empty(),
+            "Should find impls for '&Vec' (treated as Vec)"
+        );
+        // With basename lookup, &Vec and Vec map to the same key
+        assert!(results.len() >= 4);
     }
 
     #[test]
@@ -1104,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_overlapping_type_names() {
-        // "Vec" matches both "Vec<T>" and "&Vec<T>" and "VecDeque<T>"
+        // "Vec" and "VecDeque" are different basenames
         let mut index = sample_index();
         index.impls.push(TraitImpl {
             trait_path: "core::clone::Clone".to_string(),
@@ -1115,30 +1102,28 @@ mod tests {
             associated_types: vec![],
             methods: vec![MethodSig::simple("clone")],
         });
+        // Invalidate cache since we mutated impls
+        index.invalidate_cache();
 
-        let results = index.find_impls_for("Vec");
-        // Should match Vec<T>, &Vec<T>, and VecDeque<T>
-        let types: Vec<&str> = results.iter().map(|r| r.for_type.as_str()).collect();
+        let vec_results = index.find_impls_for("Vec");
+        let deque_results = index.find_impls_for("VecDeque");
+        // Vec should NOT match VecDeque
         assert!(
-            types.iter().any(|t| t.contains("VecDeque")),
-            "Should also match VecDeque: {:?}",
-            types
+            !vec_results.iter().any(|r| r.for_type.contains("VecDeque")),
+            "Vec should not match VecDeque"
         );
+        assert_eq!(deque_results.len(), 1, "VecDeque should have its own entry");
     }
 
     #[test]
-    fn test_trait_path_vs_name_distinction() {
+    fn test_trait_name_lookup() {
         let index = sample_index();
-        // find_implementors should match both by exact name and by path substring
+        // find_implementors uses exact short trait name
         let by_name = index.find_implementors("Display");
+        assert_eq!(by_name.len(), 2, "Should find 2 Display impls");
+        // Path substring search no longer supported — use short name
         let by_path = index.find_implementors("core::fmt::Display");
-        assert_eq!(
-            by_name.len(),
-            by_path.len(),
-            "name search ({}) and path search ({}) should find same results",
-            by_name.len(),
-            by_path.len()
-        );
+        assert_eq!(by_path.len(), 0, "Full path doesn't match short name key");
     }
 
     #[test]
