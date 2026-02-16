@@ -78,10 +78,15 @@ let cached = StdIndex::load_from_sysroot()?;
 
 ## Prerequisites
 
+> Note: rustdex depends on rustdoc JSON features that are available only on the Rust **nightly** toolchain. Generating or using the rustdex index therefore requires a nightly toolchain with the JSON docs component.
+
 ```bash
-# Install the JSON documentation component
-rustup component add rust-docs-json
+# Install nightly toolchain and the JSON documentation component for nightly
+rustup toolchain install nightly
+rustup component add rust-docs-json --toolchain nightly
 ```
+
+This repository includes a `rust-toolchain.toml` that requests `nightly` and the `rust-docs-json` component; `cargo` run inside the repo will automatically use that toolchain (rustup will install it if needed).
 
 ## Index location
 
