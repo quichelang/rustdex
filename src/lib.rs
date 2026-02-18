@@ -212,7 +212,7 @@ impl IndexBuilder {
                                 _ => return None,
                             };
                             let name = method_item.name.clone()?;
-                            Some(extract_method_sig(&name, func, &path_lookup))
+                            Some(extract_method_sig(&name, func, &path_lookup, &type_params))
                         })
                         .collect();
 
@@ -239,7 +239,7 @@ impl IndexBuilder {
                                 .cloned()
                                 .unwrap_or_else(|| name.clone());
 
-                            let sig = extract_method_sig(name, func, &path_lookup);
+                            let sig = extract_method_sig(name, func, &path_lookup, &[]);
                             functions.push(FunctionRecord {
                                 path,
                                 name: name.clone(),
@@ -265,6 +265,7 @@ fn extract_method_sig(
     name: &str,
     func: &rustdoc_types::Function,
     path_lookup: &HashMap<rustdoc_types::Id, String>,
+    impl_type_params: &[String],
 ) -> MethodSig {
     let mut receiver = ReceiverMode::None;
     let mut params = Vec::new();
@@ -301,10 +302,25 @@ fn extract_method_sig(
         Some(ty) => format_type(ty, path_lookup),
         None => "()".to_string(),
     };
+    let method_type_params: Vec<String> = func
+        .generics
+        .params
+        .iter()
+        .map(format_generic_param)
+        .collect();
+    let method_where_predicates: Vec<String> = func
+        .generics
+        .where_predicates
+        .iter()
+        .map(|wp| format!("{wp:?}"))
+        .collect();
 
     MethodSig {
         name: name.to_string(),
         receiver,
+        impl_type_params: impl_type_params.to_vec(),
+        method_type_params,
+        method_where_predicates,
         params,
         return_type,
     }
@@ -445,6 +461,9 @@ fn synthetic_slice_impl() -> TraitImpl {
         MethodSig {
             name: name.to_string(),
             receiver: recv,
+            impl_type_params: vec!["T".to_string()],
+            method_type_params: Vec::new(),
+            method_where_predicates: Vec::new(),
             params,
             return_type: ret.to_string(),
         }
